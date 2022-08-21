@@ -1,15 +1,10 @@
 # **青训营结业项目答辩汇报**
 
 ## 一、项目介绍
+- 项目概括：实现一个简易分布式计算系统最核心的部分：MySQL协议、SQL解析、验证、优化器、执行器、多种支持算子等等，在这里我们不考虑垃圾回收、高并发安全等拓展功能。
 
-
-
-
-
-
-
-
-
+- 项目地址：
+- Github地址：https://github.com/bytedance-training-camp/simple-distributed-sql-engine
 ## 二、项目分工
 
 
