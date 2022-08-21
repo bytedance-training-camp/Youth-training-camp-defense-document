@@ -60,7 +60,28 @@
 ### 3.3项目代码介绍
 #### 用户界面-网络协议
 
-关于如何实现MySQL协议的代码都放在server包中。启动server时，首先在协议层入口，有一个Go retinue监听端口，等待从客户端发来的包，并对发来的包做处理，在server文件夹的conn中，这里可以认为是分布式存储系统的入口。首先在clientConn Run( )中，这里会在一个循环中，不断读取网络包。
+关于如何实现MySQL协议的代码都放在server包中。启动server时，首先在协议层入口，有一个Go retinue监听端口， for 循环起两个 Listener goroutine 处理客户端发过来的消息。等待从客户端发来的包，并对发来的包做处理
+
+```go
+//启动server
+func (s *Server) Run() error {
+	go s.startNetworkListener(s.listener, false, errChan)
+	go s.startNetworkListener(s.socket, true, errChan)
+        ......
+}
+
+func (s *Server) startNetworkListener(listener net.Listener, isUnixSocket bool, errChan chan error) {
+	for {
+		conn, err := listener.Accept()
+        ......
+		go s.onConn(clientConn)
+	    }
+}
+```
+
+
+
+在server文件夹的conn中，这里可以认为是分布式存储系统的入口。首先在clientConn Run( )中，这里会在一个循环中，不断读取网络包。
 
 ```go
 data, err := cc.readPacket()//在一个循环中，不断的读取网络包
