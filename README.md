@@ -113,7 +113,7 @@ err = cc.writeResultset(ctx, rss[0], false, 0, 0)
 
 
 #### SQL解析与验证
-[image](https://github.com/bytedance-training-camp/-/blob/main/img/img/QQ%E5%9B%BE%E7%89%8720220821094807.jpg)
+![image](https://github.com/bytedance-training-camp/-/blob/main/img/img/QQ%E5%9B%BE%E7%89%8720220821094807.jpg)
 
 - **parser**
 
@@ -206,7 +206,7 @@ session.go 805:             stmt, err := compiler.Compile(goCtx, stmtNode)
 
 1. 首先我们要提取出执行器的接口，定义出执行方法、事务获取和相应提交、回滚、关闭的定义，同时由于执行器是一种标准的执行过程，所以可以由抽象类进行实现，对过程内容进行模板模式的过程包装。在包装过程中定义抽象类，由具体的子类来实现。
 2. 之后是对 SQL 的处理，在执行 SQL 的时候，分为了简单处理和预处理，预处理中包括准备语句、参数化传递、执行查询，以及最后的结果封装和返回。
-[image](https://github.com/bytedance-training-camp/-/blob/main/img/img/image-20220818150800016.png)
+![image](https://github.com/bytedance-training-camp/-/blob/main/img/img/image-20220818150800016.png)
 
 具体代码：
 
