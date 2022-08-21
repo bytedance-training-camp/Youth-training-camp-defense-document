@@ -112,6 +112,8 @@ err = cc.writeResultset(ctx, rss[0], false, 0, 0)
 以上是协议层的入口。协议层的出口用到上面提到的writeresult方法，根据MySQL协议的要求，把结果写回客户端。
 ![image](https://github.com/bytedance-training-camp/-/blob/main/img/img/%E5%9B%BE%E7%89%871.png)
 
+------
+
 
 #### SQL解析与验证
 ![image](https://github.com/bytedance-training-camp/-/blob/main/img/img/QQ%E5%9B%BE%E7%89%8720220821094807.jpg)
@@ -246,7 +248,6 @@ TiDB 的执行引擎是以 Volcano 模型运行，所有的物理 Executor 构�
         }
 ```
 
-------
 
 - **用Druid SQL Parser解析SQL**
 
@@ -286,9 +287,6 @@ ExportParameterVisitor用来提取SQL中的变量参数
 SchemaStatVisitor 用来统计SQL中使用的表、字段、过滤条件、排序表达式、分组表达式
 SQL格式化 Druid内置了基于语义的SQL格式化功能
 
-
-
-------
 
 - **SQL Compile**
 
