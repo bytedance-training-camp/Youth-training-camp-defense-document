@@ -132,7 +132,7 @@ err = cc.writeResultset(ctx, rss[0], false, 0, 0)
 
 
 #### SQL解析与验证
-![image](https://github.com/bytedance-training-camp/-/blob/main/img/img/QQ%E5%9B%BE%E7%89%8720220821094807.jpg)
+![image](https://github.com/bytedance-training-camp/Youth-training-camp-defense-document/blob/main/img/QQ%E5%9B%BE%E7%89%8720220821094807.jpg)
 
 - **parser**
 
@@ -248,7 +248,7 @@ return &recordSet{
 
 TiDB 的执行引擎是以 Volcano 模型运行，所有的物理 Executor 构成一个树状结构，每一层通过调用下一层的 Next/NextChunk() 方法获取结果。
 
-![执行器树](https://img1.www.pingcap.com/prod/1_c3e07627e9.png)
+![执行器树](https://github.com/bytedance-training-camp/Youth-training-camp-defense-document/blob/main/img/image-20220818150800016.png)
 
 这里的 `rs`即为一个 `RecordSet`接口，对其不断的调用 `Next()`，拿到更多结果，返回给 MySQL Client。 第二类语句是 Insert 这种不需要返回数据的语句，只需要把语句执行完成即可。这类语句也是通过 `Next`驱动执行，驱动点在 [构造 `recordSet`结构之前 ](https://github.com/pingcap/tidb/blob/source-code/executor/adapter.go#L251)：
 
