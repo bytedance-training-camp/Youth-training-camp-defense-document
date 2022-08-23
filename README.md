@@ -336,6 +336,165 @@ func TryFastPlan(ctx sessionctx.Context, node ast.Node) (p Plan) {
 }
 ```
 
+------
+#### TinyKV
+##### 大致实现
+
+TinyKV使用**有序的数组的排列**，可以看作是一个提供了如下性质的 KV 引擎：
+
+- Key 和 Value 都是 bytes 数组，也就是说无论原先的类型是什么，我们都要序列化后再存入
+- Scan(startKey)，任意给定一个 Key，这个接口可以按顺序返回所有大于等于这个 startKey 数据。
+- Set(key, value)，将 key 的值设置为 value。
+
+##### 具体实现
+
+- ##### 逻辑结构
+
+对每个表分配一个 TableID，每一行分配一个 RowID（如果表有整数型的 Primary Key，那么会用 Primary Key 的值当做 RowID），其中 TableID 在整个集群内唯一，RowID 在表内唯一，这些 ID 都是 int64 类型。 每行数据按照如下规则进行编码成 Key-Value pair：
+
+```
+    Key： tablePrefix_tableID_recordPrefixSep_rowID
+    Value: [col1, col2, col3, col4]
+```
+
+- ##### 存储结构
+
+TinyKV使用LSM树进行读写，相比 B+ 树以牺牲读性能的代价在写入性能上获得了较大的提升，同时其特性也使得 TinyKV 可以有序的存储 KV pair，为上层 TinySql 的存储提供很大方便。
+
+LSM树主要有三个组成部分：
+![image](https://github.com/bytedance-training-camp/Youth-training-camp-defense-document/blob/main/img/QQ%E5%9B%BE%E7%89%8720220823095201.png)
+***1) MemTable***
+
+MemTable是在**内存**中的数据结构，用于保存最近更新的数据，会按照Key有序地组织这些数据，LSM树对于具体如何组织有序地组织数据并没有明确的数据结构定义，例如Hbase使跳跃表来保证内存中key的有序。
+
+因为数据暂时保存在内存中，内存并不是可靠存储，如果断电会丢失数据，因此通常会通过WAL(Write-ahead logging，预写式日志)的方式来保证数据的可靠性。
+
+***2) Immutable MemTable***
+
+当 MemTable达到一定大小后，会转化成Immutable MemTable。Immutable MemTable是将转MemTable变为SSTable的一种中间状态。写操作由新的MemTable处理，在转存过程中不阻塞数据更新操作。
+
+***3) SSTable(Sorted String Table)***
+
+**有序键值对**集合，是LSM树组在**磁盘**中的数据结构。为了加快SSTable的读取，可以通过建立key的索引以及布隆过滤器来加快key的查找。
+
+##### 项目实现
+
+服务启动时调用registerStores()函数注册存储引擎tikv和mocktikv，调用createStoreAndDomain()函数根据提供的参数（如未提供则使用默认值）创建存储引擎。
+
+在 TinySql 中，事务的执行过程会被缓存在 buffer 中，在提交时，才会通过 Percolator 提交协议将其完整的写入到分布的 TiKV 存储引擎中。这一调用的入口是 `store/tikv/txn.go` 中的 `tikvTxn.Commit` 函数。
+
+```go
+func (txn *tikvTxn) Commit(ctx context.Context) error {
+   if !txn.valid {
+      return kv.ErrInvalidTxn
+   }
+   defer txn.close()
+
+   failpoint.Inject("mockCommitError", func(val failpoint.Value) {
+      if val.(bool) && kv.IsMockCommitErrorEnable() {
+         kv.MockCommitErrorDisable()
+         failpoint.Return(errors.New("mock commit error"))
+      }
+   })
+
+   // connID is used for log.
+   var connID uint64
+   val := ctx.Value(sessionctx.ConnID)
+   if val != nil {
+      connID = val.(uint64)
+   }
+
+   var err error
+   committer := txn.committer
+   if committer == nil {
+      committer, err = newTwoPhaseCommitter(txn, connID)
+      if err != nil {
+         return errors.Trace(err)
+      }
+   }
+   if err := committer.initKeysAndMutations(); err != nil {
+      return errors.Trace(err)
+   }
+   if len(committer.keys) == 0 {
+      return nil
+   }
+
+   err = committer.execute(ctx)
+   return errors.Trace(err)
+}
+```
+
+在执行时，一个事务可能会遇到其他执行过程中的事务，此时需要通过 Lock Resolve 组件来查询所遇到的事务状态，并根据查询到的结果执行相应的措施。
+
+##### percolator 协议
+
+- percolator 分为 prewrite 和 commit 阶段
+- 为了防止出现数据部分可见等情况，在 prewrite 阶段实际进行写数据，在 commit 阶段才让数据对外可见
+- rollback keys 用于回滚事务
+- check TxnStatus 通过查询 Lock 所属的 Primary Key 来判断事务的状态
+- resolve locks 根据 check TxnStatus 得到的结果进行相应处理
+
+因为 tinykv 底层是 multi-raft 的实现，所以是分多 region 的，而且 key 是由 range 来分区的，因此首先需要将 keys 进行划分。该划分在 GroupKeysByRegion 函数中实现，只需要调用 LocateKey 并进行一些额外判断
+
+percolator 的第一阶段是 prewrite， 这里 tinysql 的 prewrite 会向 tinykv 层的 percolator 发送一个 prewrite 请求，进行数据的写入，在 Prewrite 阶段，对于一个 Key 的操作会写入两条记录:
+
+- Default CF 中存储了实际的 KV 数据。
+- Lock CF 中存储了锁，包括 Key 和时间戳信息，会在 Commit 成功时清理。
+
+###### prewrite phase
+
+- 首先 buildPrewriteRequest
+
+- 然后发送请求到 tinykv 层
+
+- 判断 regionErr
+
+- 如果出现 keyErrs ，则解析出对应的冲突 locks，然后进行 ResolveLocks
+
+- - 在prewrite的时候，如果有一些由其他事务留下的重叠锁，tinykv 将返回 keyErr。这些事务的状态是不明确的。ResolveLocks 将通过锁来检查事务的状态并解决它们。
+
+###### commit phase
+
+如果prewrite 成功了，需要进入第二阶段：commit phase。该阶段 tinysql 会向 tinykv 发送 commit request，先将主键所在的group 进行提交，如果主键提交成功，我们就标记这次事务提交成功，然后再进行其他 group 的并行提交（该过程在2pc.go的 twoPhaseCommitter.doActionOnKeys中实现）：
+
+- 首先 buildCommitRequest
+- 然后发送请求到 tinykv 层
+- 对各自可能的错误返回进行特定处理
+- 设置 committed 为 true
+
+###### rollback
+
+如果 prewrite 失败了，或者由于其他原因事务执行失败，就需要进行 rollback：
+
+- 首先 buildCleanupRequest
+- 然后发送请求到 tinykv 层
+- 对各自可能的错误返回进行特定处理
+
+##### 总结
+
+check txnstatus 是 resolve lock的基础，check txn status可以去确认一个键是否有锁、锁的状态以及该键的主键状态（提交or回滚）。在 Percolator 协议下，会通过查询 Lock 所属的 Primary Key 来判断事务的状态：
+
+- 首先还是先建立 request
+- 然后判断主键的 region 并发送请求
+- 对各自可能的错误返回进行特定处理
+- 如果 cmdResp.LockTtl != 0 就设置 status 的 ttl，否则就设置 status 的 commitTS 为 cmdresp.commitTS
+
+我们可以通过checkTxnStatus来确定事务的状态，如果主键提交了，可以得到其 commitTs，如果主键还在提交中，可以得到lock信息来判断锁是否过期 ，如果是 rollback，可以得到 commitTs为0。因此我们就可以通过事务的这些status来判断如何处理锁：
+
+- Lock Resolver 的职责就是当一个事务在提交过程中遇到 Lock 时，需要如何应对:
+  当一个事务遇到 Lock 时，可能有几种情况。
+
+- - Lock 所属的事务还未提交这个 Key，Lock 尚未被清理；
+  - Lock 所属的事务遇到了不可恢复的错误，正在回滚中，尚未清理 Key；
+  - Lock 所属事务的节点发生了意外错误，例如节点 crash，这个 Lock 所属的节点已经不能够更新它。
+
+在 Percolator 协议下，会通过查询 Lock 所属的 Primary Key 来判断事务的状态， 但是当读取到一个未完成的事务（Primary Key 的 Lock 尚未被清理）时，我们所期望的， 是等待提交中的事物至完成状态，并且清理如 crash 等异常留下的垃圾数据。 此时会借助 ttl 来判断事务是否过期，遇到过期事务时则会主动 Rollback 它。
+
+对于 get 函数，需要补充的只是：从 keyErr 中解析出锁，然后进行 resolveLock
+
+------
+
+
 
 
 
