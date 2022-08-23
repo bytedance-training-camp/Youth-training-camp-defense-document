@@ -716,7 +716,228 @@ check txnstatus 是 resolve lock的基础，check txn status可以去确认一�
 ------
 
 
+------
+#### 优化部分
 
+此模块负责进行合法性检查及名字绑定、由AST生成逻辑执行计划，并基于一系列优化规则进行优化，生成物理执行计划并返回。
+
+模块的入口为：
+
+```go
+// executor/compiler.go
+// 将AST结点转化为物理执行计划
+func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (*ExecStmt, error) {
+    // 进行合法性检查及名字绑定
+    infoSchema := infoschema.GetInfoSchema(c.Ctx)
+    if err := plannercore.Preprocess(c.Ctx, stmtNode, infoSchema); err != nil {
+        return nil, err
+    }
+
+    // 优化，生成物理执行计划
+    finalPlan, names, err := planner.Optimize(ctx, c.Ctx, stmtNode, infoSchema)
+    if err != nil {
+        return nil, err
+    }
+
+    return &ExecStmt{
+        InfoSchema:  infoSchema,
+        Plan:        finalPlan,
+        Text:        stmtNode.Text(),
+        StmtNode:    stmtNode,
+        Ctx:         c.Ctx,
+        OutputNames: names,
+    }, nil
+}
+```
+
+在`Optimize`函数中，首先由AST构造逻辑执行计划：
+
+```go
+// planner/optimize.go
+builder := plannercore.NewPlaBuilder(sctx, is)
+p, err := builder.Build(ctx, node)
+if err != nil {
+    return nil, nil, err
+}
+logic, isLogicalPlan := p.(plannercore.LogicalPlan)
+```
+
+再进行优化，生成最终执行计划：
+
+```go
+// planner/optimize.go
+finalPlan, err := plannercore.DoOptimize(ctx, builder.GetOptFlag(), logic)
+```
+
+在`DoOptimize`函数中，会进行逻辑优化：
+
+```go、、
+// planner/core/optimizer.go
+logic, err := logicalOptimize(ctx, flag, logic)
+if err != nil {
+    return nil, err
+}
+```
+
+```go
+// planner/core/optimizer.go
+// flag为掩码，代表需要应用哪些优化规则
+func logicalOptimize(ctx context.Context, flag uint64, logic LogicalPlan) (LogicalPlan, error) {
+    var err error
+    for i, rule := range optRuleList {
+        if flag&(1<<uint(i)) == 0 {
+            continue
+        }
+        // 遍历优化规则，调用rule.optimize进行优化
+        logic, err = rule.optimize(ctx, logic)
+        if err != nil {
+            return nil, err
+        }
+    }
+    return logic, err
+}
+```
+
+其中，`optRuleList`为优化规则列表：
+
+```go
+// planner/core/optimizer.go
+var optRuleList = []logicalOptRule{
+    &columnPruner{},
+    &buildKeySolver{},
+    &aggregationEliminator{},
+    &projectionEliminator{},
+    &maxMinEliminator{},
+    &ppdSolver{},
+    &outerJoinEliminator{},
+    &aggregationPushDownSolver{},
+    &pushDownTopNOptimizer{},
+    &joinReOrderSolver{},
+}
+```
+
+类型`logicalOptRule`为优化规则：
+
+```go
+// planner/core/optimizer.go
+type logicalOptRule interface {
+    optimize(context.Context, LogicalPlan) (LogicalPlan, error)
+    name() string
+}
+```
+
+列表中的每种规则均有相应的`optimize`方法实现，位于`planner/core/rule*`中。
+
+**列裁剪**
+
+列裁剪算法位于`planner/core/rule_column_prunning.go`中。逻辑执行计划`LogicalPlan`接口包含列裁剪`PruneColumns`方法，而每种逻辑执行计划结点均实现了`LogicalPlan`接口。`planner/core/rule_column_prunning.go`则包含了每种逻辑执行计划结点对应的列裁剪`PruneColumns`方法实现。
+
+列裁剪目的为裁剪掉不需要读取的列，以节约IO资源；算法实现为自顶向下遍历逻辑执行计划树，并调用每个结点所实现的`PruneColumns`方法：某个结点需要用到的列，等于它自己需要用到的列，加上父节点需要用到的列：
+
+```go
+// lp为逻辑执行计划树的根结点
+func (s *columnPruner) optimize(ctx context.Context, lp LogicalPlan) (LogicalPlan, error) {
+    err := lp.PruneColumns(lp.Schema().Columns)
+    return lp, err
+}
+```
+
+例如对于`Select`算子，`PruneColumns`方法实现为：
+
+```go
+func (p *LogicalSelection) PruneColumns(parentUsedCols []*expression.Column) error {
+    child := p.children[0]
+    // 父节点用到的列 <= 父节点用到的列 + 当前结点用到的列
+    parentUsedCols = expression.ExtractColumnsFromExpressions(parentUsedCols, p.Conditions, nil                )
+    // 调用子节点的PruneColumns方法，传入父节点用到的列
+    return child.PruneColumns(parentUsedCols)
+}
+```
+
+**Predicate及Limit下推**
+
+`planner/core/rule_predicate_push_down`中实现了将Predicate下推到Project与Join算子下面。
+
+谓词下推目的为将能下推的条件尽量下推，使得提前过滤更多的记录，减小参与Join等算子的数据量。
+
+谓词下推接口函数为：
+
+```go
+func (p *baseLogicalPlan) PredicatePushDown(predicates []expression.Expression) ([]expression.Expression, LogicalPlan)
+```
+
+其处理当前的执行计划p，参数predicates表示要添加的过滤条件；函数返回值为无法下推的条件以及新生成的执行计划。
+
+例如，对于Join算子的谓词下推，首先会尽可能将左外连接和右外连接简化为内连接；再收集所有过滤条件，区分哪些是 Join 的等值条件，哪些是 Join 需要用到的条件，哪些全部来自于左子节点，哪些全部来自于右子节点；区分之后，对于内连接，可以把左条件和右条件分别向左右子节点下推。等值条件和其它条件保留在当前的 Join 算子中，剩下的返回。
+
+```go
+case InnerJoin:
+    tempCond := make([]expression.Expression, 0, len(p.LeftConditions)+len(p.RightConditions)+len(p.EqualConditions)+len(p.OtherConditions)+len(predicates))
+    tempCond = append(tempCond, p.LeftConditions...)
+    tempCond = append(tempCond, p.RightConditions...)
+    tempCond = append(tempCond, expression.ScalarFuncs2Exprs(p.EqualConditions)...)
+    tempCond = append(tempCond, p.OtherConditions...)
+    tempCond = append(tempCond, predicates...)
+    tempCond = expression.ExtractFiltersFromDNFs(p.ctx, tempCond)
+    tempCond = expression.PropagateConstant(p.ctx, tempCond)
+    dual := Conds2TableDual(p, tempCond)
+    if dual != nil {
+        return ret, dual
+    }
+    equalCond, leftPushCond, rightPushCond, otherCond = p.extractOnCondition(tempCond, true, true)
+    // 把左条件和右条件分别向左右子节点下推
+    p.LeftConditions = nil
+    p.RightConditions = nil
+    // 等值条件和其它条件保留在当前的 Join 算子中
+    p.EqualConditions = equalCond
+    p.OtherConditions = otherCond
+    leftCond = leftPushCond
+    rightCond = rightPushCond
+}
+leftCond = expression.RemoveDupExprs(p.ctx, leftCond)
+rightCond = expression.RemoveDupExprs(p.ctx, rightCond)
+leftRet, lCh := p.children[0].PredicatePushDown(leftCond)
+rightRet, rCh := p.children[1].PredicatePushDown(rightCond)
+addSelection(p, lCh, leftRet, 0)
+addSelection(p, rCh, rightRet, 1)
+p.updateEQCond()
+for _, eqCond := range p.EqualConditions {
+    p.LeftJoinKeys = append(p.LeftJoinKeys, eqCond.GetArgs()[0].(*expression.Column))
+    p.RightJoinKeys = append(p.RightJoinKeys, eqCond.GetArgs()[1].(*expression.Column))
+}
+p.mergeSchema()
+buildKeyInfo(p)
+return ret, p.self
+```
+
+谓词下推算法的执行流程与列裁剪类似：自顶向下遍历执行计划树，在当前结点的`PredicatePushDown`方法中处理谓词下推并调用子节点的`PredicatePushDown`方法。
+
+在`planner/core/rule_topn_push_down`中，还实现了将Limit下推到Project与Join算子下面。例如：
+
+```go
+func (p *LogicalProjection) pushDownTopN(topN *LogicalTopN) LogicalPlan {
+    for _, expr := range p.Exprs {
+        if expression.HasAssignSetVarFunc(expr) {
+            return p.baseLogicalPlan.pushDownTopN(topN)
+        }
+    }
+    if topN != nil {
+        for _, by := range topN.ByItems {
+            by.Expr = expression.ColumnSubstitute(by.Expr, p.schema, p.Exprs)
+        }
+
+        // 删除无意义的常量排序项
+        for i := len(topN.ByItems) - 1; i >= 0; i-- {
+            switch topN.ByItems[i].Expr.(type) {
+            case *expression.Constant:
+                topN.ByItems = append(topN.ByItems[:i], topN.ByItems[i+1:]...)
+            }
+        }
+    }
+    p.children[0] = p.children[0].pushDownTopN(topN)
+    return p
+}
+```
 
 
 
