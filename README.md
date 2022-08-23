@@ -714,7 +714,197 @@ check txnstatus 是 resolve lock的基础，check txn status可以去确认一�
 对于 get 函数，需要补充的只是：从 keyErr 中解析出锁，然后进行 resolveLock
 
 ------
+### 执行器
+在此模块中实现了火山模型的执行引擎并支持向量化执行。在火山模型中，每个算子都实现了三个接口：
+- Open，对当前执行器的所需的资源进行初始化。
+- Next，从孩子节点（如果存在）取必需的数据，计算并返回一条结果。
+- Close，对执行器所需的资源进行释放。
 
+在这以执行器`Selection`为例，`Selection`实现了`Executor`接口，它也使用了`Open`/`Next`/`Close`三个方法。每一个`Executor`的实现都是从`baseExecutor`扩展出来的，一般都会继承其中的`base`/`Schema`方法。当上层`Executor`的Next方法被调用时，被调用的`Executor`通过调用下层`Executor`的Next方法返回的`Chunk`，经过一定的处理来构建本层的返回。
+```go
+type Executor interface {
+	base() *baseExecutor
+	Open(context.Context) error
+	Next(ctx context.Context, req *chunk.Chunk) error
+	Close() error
+	Schema() *expression.Schema
+}
+```
+以下为`baseExecutor`的定义：
+
+```go
+type baseExecutor struct {
+	ctx           sessionctx.Context      // 执行上下文
+	id            fmt.Stringer            // 标识
+	schema        *expression.Schema      // 表结构
+	initCap       int                     // Chunk初始容量
+	maxChunkSize  int                     // 返回Chunk的最大尺寸
+	children      []Executor              // 下层Executor
+	retFieldTypes []*types.FieldType      // 返回的列信息
+}
+```
+以下为`SelectionExec`的定义：
+
+```go
+// SelectionExec represents a filter executor.
+type SelectionExec struct {
+	baseExecutor                               // 基础结构
+
+	batched     bool                           // 是否以批处理的形式返回结果
+	filters     []expression.Expression        // 过滤器表达式列表
+	selected    []bool                         // 过滤结果buffer
+	inputIter   *chunk.Iterator4Chunk          // 迭代器
+	inputRow    chunk.Row                      // 迭代当前行
+	childResult *chunk.Chunk                   // 下层Executor返回的结果buffer
+}
+```
+`SelectionExec`对`Executor`接口的实现，直接继承`baseExecutor`的base方法和Schema方法。
+
+```go
+// base returns the baseExecutor of an executor, don't override this method!
+func (e *baseExecutor) base() *baseExecutor {
+	return e
+}
+```
+
+```go
+// Schema returns the current baseExecutor's schema. If it is nil, then create and return a new one.
+func (e *baseExecutor) Schema() *expression.Schema {
+	if e.schema == nil {
+		return expression.NewSchema()
+	}
+	return e.schema
+}
+```
+#### Open方法
+`SelectionExec`对Open方法进行了重写，本质上Open方法是进行了初始化操作。`Open`中进行的仅仅是状态的初始化，并没有执行是实质的计算（`e.childResult`使用了`newFirstChunk`的时候只是进行了字段/容量/大小的初始化，并没有进行内容填充），`e.childResult`是空的，`e.inputIter`和`e.inputRow`也是空的，需要在后续步骤中进行初始化。
+
+```go
+// Open implements the Executor Open interface.
+func (e *SelectionExec) Open(ctx context.Context) error {
+  // 调用baseExecutor的初始化
+	if err := e.baseExecutor.Open(ctx); err != nil {
+		return err
+	}
+  // newFirstChunk根据下层Executor的属性来构建chunk
+	e.childResult = newFirstChunk(e.children[0])
+  // 判断filters是否可以向量化执行
+  // 其实就是检查是否所有的filter都可以向量化，只有所有filter都可以向量化，才可以进行批进行
+	e.batched = expression.Vectorizable(e.filters)
+	if e.batched {
+	// 如果可以进行批执行的话，构建一个bool切片作为buffer，来保存过滤器的选择情况
+	// 在这里初始化好了这块空间，只要之后没有发生切片的resize，那么始终使用的是这块空间
+	// 减轻内存分配和GC的压力
+		e.selected = make([]bool, 0, chunk.InitialCapacity)
+	}
+  // 这里仅仅是完成了iterator和chunk的绑定，此时chunk中没有数据，iterator也没有意义。
+	e.inputIter = chunk.NewIterator4Chunk(e.childResult)
+  // 这里就是指向了一个空Row
+	e.inputRow = e.inputIter.End()
+	return nil
+}
+```
+`baseExecutor`的实现如下：
+
+```go
+// Open initializes children recursively and "childrenResults" according to children's schemas.
+func (e *baseExecutor) Open(ctx context.Context) error {
+  // 本质上就是遍历所有位于下层的Executor调用一遍Open
+  // 位于下层的Executor会先于当前Executor被初始化
+	for _, child := range e.children {
+		err := child.Open(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+#### Next方法
+`SelectionExec`对Next方法进行了重写。调用Next的实际执行流程如下：
+1. 在第一次调用`SelectionExec.Next`的时候不进入内循环，因为循环条件`e.inputRow != e.inputIter.End()`此时是不成立的，二者都是空的Row结构体。
+2. 调用Next将下层数据加载到`e.childResult`当中，进行一些检查。
+3. 更新`e.inputRow`使之对应`e.inputIter`的第一个数据。
+4. 使用`expression.VectorizedFilter`根据`e.filters`的条件将下层结果集数据的根据过滤器的过滤结果存放到`e.selected`。
+5. 回到外循环开头往下执行，`e.inputRow != e.inputIter.End()`此时已经成立了，可以直接进入内循环。
+6. 在内循环中，需要判断结果集是否已经被填满。
+- 如果没有被填满，那么就根据筛选结果，考虑是否将遍历到行放到结果集中，当遍历结束时，就开始继续往下执行。
+- 如果已经被填满，那么就直接返回。在下层结果集中遍历的状态保存在`e.inputRow`/`e.inputIter`中，filter过滤的结果放在`e.selected`中，等待下一次Next调用的时候再调用。
+7. 当第n次调用`SelectionExec.Next`时：
+- 如果上一次调用Next时还有下层结果集的数据没有遍历完，那么当时的遍历状态仍然保留在`e.inputRow`/`e.inputIter`/`e.selected`/`e.childResult`中，那么可以直接进入内循环。
+- 如果上一次调用Next时刚好下层结果集的数据也遍历完了，那么`e.inputRow`就会是一个空Row，就得重新加载下层数据。
+```go
+// Next implements the Executor Next interface.
+func (e *SelectionExec) Next(ctx context.Context, req *chunk.Chunk) error {
+  // 在批处理时，会返回maxChunkSize限定大小的结果集
+	req.GrowAndReset(e.maxChunkSize)
+
+	if !e.batched {
+		return e.unBatchedNext(ctx, req)
+	}
+
+	/*
+		Exit the loop when:
+			1. the `req` chunk` is full.
+			2. there is no further results from child.
+			3. meets any error.
+	 */
+	for {
+		for ; e.inputRow != e.inputIter.End(); e.inputRow = e.inputIter.Next() {
+		// 根据过滤结果buffer中的数据判断当前行是否被选中，如果被选中了则添加到结果集中
+			if e.selected[e.inputRow.Idx()]{
+				req.AppendRow(e.inputRow)
+		if req.IsFull(){    //如果结果集被填满了，那么需要将inputRow未被检索的第一行，并返回
+			e.inputRow = e.inputIter.Next()
+				return nul
+			    }
+			}
+		}
+// 这里是调用volcano模型处在下层的子语句的Next方法，并赋值到当前的childResult中，更新下层结果集内容
+		err := Next(ctx, e.children[0], e.childResult)
+		if err != nil {
+			return err
+		}
+		// no more data.
+		if e.childResult.NumRows() == 0 {
+			return nil
+		}
+		// 这里主要是重复利用selected所申请的空间，注意一定要赋值e.selected，进行同步改变
+		e.inputRow = e.inputIter.Begin()
+	// selected保存使用向量filters过滤后的结果
+		e.selected, err = expression.VectorizedFilter(e.ctx, e.filters, e.inputIter, e.selected)
+		if err != nill{
+			return nil
+		}
+	}
+}
+```
+#### Close方法
+`SelectionExec`对Close方法进行了重写，本质上Close方法是进行了资源释放的作用。
+
+```go
+// Close implements plannercore.Plan Close interface.
+func (e *SelectionExec) Close() error {
+  // 清空两个buffer
+	e.childResult = nil
+	e.selected = nil
+	return e.baseExecutor.Close()
+}
+```
+`baseExecutor`的实现：
+```go
+// Close closes all executors and release all resources.
+func (e *baseExecutor) Close() error {
+	var firstErr error
+  // 与Open时相似，就是直接调用一遍下层Executor
+	for _, src := range e.children {
+		if err := src.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+```
 
 
 
