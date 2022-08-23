@@ -126,7 +126,7 @@ err = cc.writeResultset(ctx, rss[0], false, 0, 0)
 ```
 
 以上是协议层的入口。协议层的出口用到上面提到的writeresult方法，根据MySQL协议的要求，把结果写回客户端。
-![image](https://github.com/bytedance-training-camp/-/blob/main/img/img/%E5%9B%BE%E7%89%871.png)
+![image](https://github.com/bytedance-training-camp/Youth-training-camp-defense-document/blob/main/img/%E5%9B%BE%E7%89%871.png)
 
 ------
 
