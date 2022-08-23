@@ -39,22 +39,22 @@
 
 ### 3.2架构设计
 
+![image](https://github.com/bytedance-training-camp/Youth-training-camp-defense-document/blob/main/img/%E6%9C%AA%E5%91%BD%E5%90%8D%E7%BB%98%E5%9B%BE.drawio%20(1)(1).png)
 
+- 首先，输入命令后，进入server层，这里是与用户交互的地点，目前tinysql支持 MySQL协议。功能是解析MySQL命令并返回执行结果，具体的实现按照MySQL协议实现。
 
+- 之后，SQL语句会经过parser模块进行语法解析，最终得到AST后进入Optimizer模块，优化查询计划
+- 然后根据计划生成查询器->执行并返回结果
 
+以上主要内容对应于以下的包中：
 
-
-
-
-
-
-
-
-
-
-
-
-
+| server   | MySQL协议                                     |
+| -------- | --------------------------------------------- |
+| parser   | 语法验证                                      |
+| planner  | 合法性验证+指定查询计划+优化查询计划          |
+| executor | 执行器生成以及执行                            |
+| kv       | kv层提供存储需求                              |
+| dissql   | 通过 TiKV Client 向 TiKV 发送以及汇总返回结果 |
 
 
 ### 3.3项目代码介绍
