@@ -558,6 +558,467 @@ func (p *LogicalProjection) pushDownTopN(topN *LogicalTopN) LogicalPlan {
 }
 ```
 ------
+
+
+#### 支持的算子
+
+- **UnionScan**
+
+```go
+type PhysicalUnionScan struct {
+   basePhysicalPlan
+
+   Conditions []expression.Expression
+
+   HandleCol *expression.Column
+}
+```
+
+> 通过下推 API ，把一部分简单的 SQL 层的执行逻辑下推到 KV 层执行，减少 RPC 的次数和数据传输量，从而提升性能
+
+> 为了解决对脏数据的读取，SQL 层实现了 UnionStore 的结构，UnionStore 对 SQL 层的 Buffer 和 KV 层接口做了一个封装，事务对 KV 层的读写都经过 UnionStore 。
+>
+> > UnionStore 收到请求时会先在 Buffer 里寻找，找不到时才会调用 KV 层的接口
+>
+> > 当需要遍历数据的时候 UnionStore 会创建 Buffer 和 KV 的迭代器，并合并成一个
+
+```go
+type UnionStore interface {
+	MemBuffer
+	// GetKeyExistErrInfo gets the key exist error info for the lazy check.
+	GetKeyExistErrInfo(k Key) *existErrInfo
+    
+	// DeleteKeyExistErrInfo deletes the key exist error info for the lazy check.
+	DeleteKeyExistErrInfo(k Key)
+    
+	// WalkBuffer iterates all buffered kv pairs.
+	WalkBuffer(f func(k Key, v []byte) error) error
+    
+	// SetOption sets an option with a value, when val is nil, uses the default value of this option.
+	SetOption(opt Option, val interface{})
+    
+	// DelOption deletes an option.
+	DelOption(opt Option)
+    
+	// GetOption gets an option.
+	GetOption(opt Option) interface{}
+    
+	// GetMemBuffer return the MemBuffer binding to this UnionStore.
+	GetMemBuffer() MemBuffer
+}
+```
+
+> 为了解决 SQL 层脏数据的可见性问题，定义了Union Scan 算法以 Row 为单位，创建一个 DirtyTable 保存事务的修改
+>
+> > addedRows 保存新写入的 row， deleteRows 保存删除的 row
+
+1. 对于 `INSERT`，我们需要把 row 添加到 addedRows 里。
+
+2. 对于 `DELETE`，我们需要把 row 从 addedRows 里删掉，然后把 row 添加到 deleteRows 里。
+
+3. 对于 `UPDATE`，相当于先执行 `DELETE`, 再执行 `INSERT。`
+
+> 对于每一条下推 API 得到的结果集里的 Row，在 deleteRows 里查找，如果有，那么代表这一条结果已经被删掉，那么把它从结果集里删掉，得到过滤后的结果集。
+>
+> 把 addedRows 里的所有 Row，放到一个 slice 里，并对这个 slice 用快照结果集相同的顺序排序，生成脏数据结果集。
+>
+> 返回结果的时候，将过滤后的快照结果集与脏数据结果集进行 Merge。
+
+```go
+type DirtyTable struct {bl
+	tid int64
+	
+	addedRows   map[int64]struct{}
+	deletedRows map[int64]struct{}
+}
+```
+
+- **TableScan**
+
+> TableScan 算子实现为 Batch 方式，通过向量化计算加速计算
+
+```go
+type PhysicalTableScan struct {
+	physicalSchemaProducer
+
+	// AccessCondition is used to calculate range.
+	AccessCondition []expression.Expression
+	filterCondition []expression.Expression
+
+	Table   *model.TableInfo
+	Columns []*model.ColumnInfo
+	DBName  model.CIStr
+	Ranges  []*ranger.Range
+	pkCol   *expression.Column
+
+	TableAsName *model.CIStr
+
+	HandleIdx int
+
+	KeepOrder bool
+	Desc      bool
+}
+```
+
+
+
+- **IndexScan**
+
+> 全表扫描(索引数据)
+
+```go
+type PhysicalIndexScan struct {
+   physicalSchemaProducer
+
+   // AccessCondition is used to calculate range.
+   AccessCondition []expression.Expression
+
+   Table      *model.TableInfo
+   Index      *model.IndexInfo
+   IdxCols    []*expression.Column
+   IdxColLens []int
+   Ranges     []*ranger.Range
+   Columns    []*model.ColumnInfo
+   DBName     model.CIStr
+
+   TableAsName *model.CIStr
+
+   // dataSourceSchema is the original schema of DataSource. The schema of index scan in KV and index reader in TiDB
+   // will be different. The schema of index scan will decode all columns of index but the TiDB only need some of them.
+   dataSourceSchema *expression.Schema
+
+   Desc      bool
+   KeepOrder bool
+   // DoubleRead means if the index executor will read kv two times.
+   // If the query requires the columns that don't belong to index, DoubleRead will be true.
+   DoubleRead bool
+}
+```
+
+
+
+- **Projection**
+
+```go
+type ProjectionExec struct {
+	baseExecutor
+
+	evaluatorSuit *expression.EvaluatorSuite
+
+	prepared    bool
+	finishCh    chan struct{}
+	outputCh    chan *projectionOutput
+	fetcher     projectionInputFetcher
+	numWorkers  int64
+	workers     []*projectionWorker
+	childResult *chunk.Chunk
+
+	wg sync.WaitGroup
+
+	parentReqRows int64
+}
+```
+
+
+
+- **Filter**
+
+```go
+// Filter the input expressions, append the results to result.
+func Filter(result []Expression, input []Expression, filter func(Expression) bool) []Expression {
+	for _, e := range input {
+		if filter(e) {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+```
+
+
+
+- **Aggregate**
+
+> 这里的聚合算法为 Hash Aggregate 
+>
+> > 在Hash Aggregate 的计算过程中，Hash 表的键为聚合计算的`Group-By`列，值为聚合函数的中间结果`sum`和`count`。
+> >
+> > 输入数据输入完毕之后，扫描 Hash 表并计算，便可得到结果
+
+> 由于对分布式计算的需要，聚合函数有以下计算模式
+
+| AggFunctionMode |  输入值  | 输出值                 |
+| --------------- | :------: | ---------------------- |
+| CompleteMode    | 原始数据 | 最终结果               |
+| FinalMode       | 中间结果 | 最终结果               |
+| Partial1Mode    | 原始数据 | 中间结果               |
+| Partial2Mode    | 中间结果 | 进一步聚合后的中间结果 |
+
+
+
+- **HashJoin**
+
+> 具有以下任务
+>
+> > Main Thread
+> >
+> > > 读取所有的 Inner 表数据
+> >
+> > > 根据 Inner 表数据构造哈希表
+> >
+> > > 启动 Outer Fetcher 和 Join Worker 开始后台工作，生成 Join 结果，各个 goroutine 的启动过程由 `fetchAndProbeHashTable` 这个函数完成
+> >
+> > > 将 Join Worker 计算出的 Join 结果返回给 `NextChunk` 接口的调用方法
+>
+> > Outer Thread: 负责读取 Outer 表的数据并分发给各个 Join Worker
+>
+> > Join Work: 负责查哈希表、Join 匹配的 Inner 和 Outer 表的数据，并把结果传递给 Main Thread
+
+```go
+type HashJoinExec struct {
+   baseExecutor
+
+   outerSideExec     Executor
+   innerSideExec     Executor
+   innerSideEstCount float64
+   outerSideFilter   expression.CNFExprs
+   outerKeys         []*expression.Column
+   innerKeys         []*expression.Column
+
+   // concurrency is the number of partition, build and join workers.
+   concurrency  uint
+   rowContainer *hashRowContainer
+   // joinWorkerWaitGroup is for sync multiple join workers.
+   joinWorkerWaitGroup sync.WaitGroup
+   // closeCh add a lock for closing executor.
+   closeCh  chan struct{}
+   joinType plannercore.JoinType
+
+   // We build individual joiner for each join worker when use chunk-based
+   // execution, to avoid the concurrency of joiner.chk and joiner.selected.
+   joiners []joiner
+
+   outerChkResourceCh chan *outerChkResource
+   outerResultChs     []chan *chunk.Chunk
+   joinChkResourceCh  []chan *chunk.Chunk
+   joinResultCh       chan *hashjoinWorkerResult
+
+   prepared bool
+}
+```
+
+支持三种 Join 方式
+
+1. leftOuterJoiner
+2. rightOuterJoiner
+3. innerJoiner
+
+
+
+- **MergeJoin**
+
+```go
+type MergeJoinExec struct {
+   baseExecutor
+
+   stmtCtx      *stmtctx.StatementContext
+   compareFuncs []expression.CompareFunc
+   joiner       joiner
+   isOuterJoin  bool
+
+   prepared bool
+   outerIdx int
+
+   innerTable *mergeJoinInnerTable
+   outerTable *mergeJoinOuterTable
+
+   innerRows     []chunk.Row
+   innerIter4Row chunk.Iterator
+
+   childrenResults []*chunk.Chunk
+}
+```
+
+
+
+- **Limit**
+
+```go
+type LimitExec struct {
+   baseExecutor
+
+   begin  uint64
+   end    uint64
+   cursor uint64
+
+   // meetFirstBatch represents whether we have met the first valid Chunk from child.
+   meetFirstBatch bool
+
+   childResult *chunk.Chunk
+}
+```
+
+
+
+- **Selection**
+
+```go
+type selectionExec struct {
+   conditions        []expression.Expression
+   relatedColOffsets []int
+   row               []types.Datum
+   evalCtx           *evalContext
+   src               executor
+}
+```
+
+
+
+- **Sort**
+
+```go
+type SortExec struct {
+   baseExecutor
+
+   ByItems []*plannercore.ByItems
+   Idx     int
+   fetched bool
+   schema  *expression.Schema
+
+   // keyColumns is the column index of the by items.
+   keyColumns []int
+   // keyCmpFuncs is used to compare each ByItem.
+   keyCmpFuncs []chunk.CompareFunc
+   // rowChunks is the chunks to store row values.
+   rowChunks *chunk.List
+   // rowPointer store the chunk index and row index for each row.
+   rowPtrs []chunk.RowPtr
+}
+```
+
+
+
+- **TopN**
+
+> 将相邻的 Limit 算子和 Sort 算子组合成 TopN 算子节点，表示某个排序规则提取记录的前 N 项
+
+```go
+type TopNExec struct {
+   SortExec
+   limit      *plannercore.PhysicalLimit
+   totalLimit uint64
+
+   chkHeap *topNChunkHeap
+}
+```
+
+
+
+- **TableReader**
+
+> 将 TiKV 上底层扫表算子 `TableFullScan `或 `TableRangeScan ` 得到的数据进行汇总
+
+```go
+type TableReaderExecutor struct {
+   baseExecutor
+
+   table  table.Table
+   ranges []*ranger.Range
+   // kvRanges are only use for union scan.
+   kvRanges []kv.KeyRange
+   dagPB    *tipb.DAGRequest
+   startTS  uint64
+   // columns are only required by union scan and virtual column.
+   columns []*model.ColumnInfo
+
+   // resultHandler handles the order of the result. Since (MAXInt64, MAXUint64] stores before [0, MaxInt64] physically
+   // for unsigned int.
+   resultHandler *tableResultHandler
+   plans         []plannercore.PhysicalPlan
+
+   keepOrder bool
+   desc      bool
+}
+```
+
+
+
+- **IndexReader**
+
+> 将 TiKV 上底层扫表算子 `IndexFullScan` 或 `IndexRangeScan `得到的数据进行汇总
+
+```go
+type IndexReaderExecutor struct {
+   baseExecutor
+
+   // For a partitioned table, the IndexReaderExecutor works on a partition, so
+   // the type of this table field is actually `table.PhysicalTable`.
+   table           table.Table
+   index           *model.IndexInfo
+   physicalTableID int64
+   keepOrder       bool
+   desc            bool
+   ranges          []*ranger.Range
+   // kvRanges are only used for union scan.
+   kvRanges []kv.KeyRange
+   dagPB    *tipb.DAGRequest
+   startTS  uint64
+
+   // result returns one or more distsql.PartialResult and each PartialResult is returned by one region.
+   result distsql.SelectResult
+   // columns are only required by union scan.
+   columns []*model.ColumnInfo
+   // outputColumns are only required by union scan.
+   outputColumns []*expression.Column
+
+   idxCols []*expression.Column
+   colLens []int
+   plans   []plannercore.PhysicalPlan
+}
+```
+
+
+
+- **IndexLookUpReader**
+
+> 汇总 Build 端 TiKV 扫描上来的 RowID，再去 Probe 端上根据这些 `RowID` 精确地读取 TiKV 上的数据。Build 端是 `IndexFullScan` 或 `IndexRangeScan` 类型的算子，Probe 端是 `TableRowIDScan` 类型的算子。
+
+```go
+type IndexLookUpExecutor struct {
+   baseExecutor
+
+   table     table.Table
+   index     *model.IndexInfo
+   keepOrder bool
+   desc      bool
+   ranges    []*ranger.Range
+   dagPB     *tipb.DAGRequest
+   startTS   uint64
+   // handleIdx is the index of handle, which is only used for case of keeping order.
+   handleIdx    int
+   tableRequest *tipb.DAGRequest
+   // columns are only required by union scan.
+   columns []*model.ColumnInfo
+   *dataReaderBuilder
+   // All fields above are immutable.
+
+   idxWorkerWg sync.WaitGroup
+   tblWorkerWg sync.WaitGroup
+   finished    chan struct{}
+
+   kvRanges      []kv.KeyRange
+   workerStarted bool
+
+   resultCh   chan *lookupTableTask
+   resultCurr *lookupTableTask
+
+   idxPlans []plannercore.PhysicalPlan
+   tblPlans []plannercore.PhysicalPlan
+   idxCols  []*expression.Column
+   colLens  []int
+}
+```
+------
 #### TinyKV
 ##### 大致实现
 
